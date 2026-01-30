@@ -2,3 +2,4 @@ beautifulsoup4
 duckduckgo-search
 aiohttp
 lxml
+playwright
