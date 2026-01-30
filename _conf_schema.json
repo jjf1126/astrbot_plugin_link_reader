@@ -1,95 +1,102 @@
 {
-  "enable_auto_parse": {
-    "description": "启用链接自动解析",
-    "type": "bool",
-    "default": true,
-    "hint": "关闭后插件将不会自动拦截并解析消息中的链接",
-    "obvious_hint": true
-  },
-  "max_content_length": {
-    "description": "内容截断长度",
-    "type": "int",
-    "default": 1500,
-    "hint": "限制抓取内容的最大字数，防止超出 LLM 的 Token 上限",
-    "obvious_hint": false
-  },
-  "request_timeout": {
-    "description": "请求超时时间(秒)",
-    "type": "int",
-    "default": 10,
-    "hint": "网络请求的最大等待时间，建议不要设置过长以免阻塞回复"
-  },
-  "user_agent": {
-    "description": "浏览器标识 (User-Agent)",
-    "type": "string",
-    "default": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "hint": "模拟浏览器身份进行访问，有助于减少部分网站的反爬拦截"
-  },
-  "injection_template": {
-    "description": "LLM 注入模板",
-    "type": "string",
-    "default": "【系统检测到消息中包含链接，已自动读取内容】\n链接标题：{{title}}\n链接内容摘要：\n{{content}}\n\n请基于以上链接内容，回复用户的消息：\n",
-    "hint": "支持 Jinja2 语法模板。可用变量：{{title}} (标题), {{url}} (链接), {{content}} (正文内容)。",
-    "editor_mode": true,
-    "editor_language": "plaintext"
-  },
-  "features_switch": {
-    "description": "功能开关细分",
+  "general_config": {
+    "description": "基础解析设置",
     "type": "object",
-    "hint": "针对特定类型的链接解析进行单独控制",
     "items": {
-      "parse_generic_web": {
-        "description": "解析通用网页",
+      "enable_plugin": {
+        "description": "启用链接解析",
         "type": "bool",
         "default": true,
-        "hint": "是否解析普通的新闻、博客等网页"
+        "hint": "总开关，关闭后插件将不再拦截和解析任何链接"
       },
-      "parse_social_media": {
-        "description": "解析社交媒体(知乎/微博/小红书等)",
-        "type": "bool",
-        "default": true,
-        "hint": "是否解析特定社交平台的帖子内容"
+      "max_content_length": {
+        "description": "内容截断长度",
+        "type": "int",
+        "default": 2000,
+        "hint": "解析出的文本若超过此长度将被截断，防止超出 LLM 上下文限制",
+        "obvious_hint": true
       },
-      "search_lyrics": {
-        "description": "音乐链接搜歌词",
+      "request_timeout": {
+        "description": "请求超时时间(秒)",
+        "type": "int",
+        "default": 15,
+        "hint": "网络请求的最大等待时间"
+      },
+      "user_agent": {
+        "description": "User-Agent",
+        "type": "string",
+        "default": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "hint": "模拟浏览器的 User-Agent，有助于降低被目标网站拦截的概率"
+      },
+      "prompt_template": {
+        "description": "Prompt 注入模板",
+        "type": "string",
+        "default": "\n【以下是链接的具体内容，请参考该内容进行回答】：\n{content}\n",
+        "hint": "定义解析内容如何注入到用户消息中，必须包含 {content} 占位符",
+        "editor_mode": true
+      }
+    }
+  },
+  "music_feature": {
+    "description": "音乐链接智能增强",
+    "type": "object",
+    "items": {
+      "enable_search": {
+        "description": "启用歌词/评价搜索",
         "type": "bool",
         "default": true,
-        "hint": "识别到音乐分享链接时，是否自动搜索并注入歌词"
+        "hint": "开启后，音乐链接将不直接爬取页面，而是提取歌名歌手后调用搜索工具获取歌词及热门评价",
+        "obvious_hint": true
       }
     }
   },
   "platform_cookies": {
-    "description": "社交平台 Cookies 配置",
+    "description": "社交平台 Cookie 配置",
     "type": "object",
-    "hint": "部分平台(如知乎、微博、小红书)需要 Cookie 才能获取完整内容，否则可能无法解析或内容不全。留空则尝试游客访问。",
+    "hint": "配置对应平台的 Cookie 可大幅提高抓取成功率并获取完整内容（如小红书、知乎等）。留空则尝试使用游客模式。",
     "items": {
-      "zhihu_cookie": {
-        "description": "知乎 Cookie (z_c0)",
-        "type": "string",
+      "xiaohongshu": {
+        "description": "小红书 Cookie",
+        "type": "text",
         "default": "",
-        "hint": "网页版知乎请求头中的 Cookie 字段，建议填写"
+        "hint": "请填写网页版 Cookie（关键参数：web_session）"
       },
-      "weibo_cookie": {
-        "description": "微博 Cookie (SUB)",
-        "type": "string",
+      "zhihu": {
+        "description": "知乎 Cookie",
+        "type": "text",
         "default": "",
-        "hint": "网页版微博请求头中的 Cookie 字段"
+        "hint": "请填写网页版 Cookie（关键参数：z_c0）"
       },
-      "xiaohongshu_cookie": {
-        "description": "小红书 Cookie (web_session)",
-        "type": "string",
+      "weibo": {
+        "description": "微博 Cookie",
+        "type": "text",
         "default": "",
-        "hint": "网页版小红书请求头中的 Cookie 字段"
+        "hint": "请填写网页版 Cookie（关键参数：SUB）"
+      },
+      "bilibili": {
+        "description": "哔哩哔哩 Cookie",
+        "type": "text",
+        "default": "",
+        "hint": "请填写网页版 Cookie（关键参数：SESSDATA）"
+      },
+      "douyin": {
+        "description": "抖音 Cookie",
+        "type": "text",
+        "default": "",
+        "hint": "请填写网页版 Cookie（关键参数：ttwid / odin_tt）"
+      },
+      "tieba": {
+        "description": "百度贴吧 Cookie",
+        "type": "text",
+        "default": "",
+        "hint": "请填写网页版 Cookie（关键参数：BDUSS）"
+      },
+      "lofter": {
+        "description": "LOFTER Cookie",
+        "type": "text",
+        "default": "",
+        "hint": "请填写网页版 Cookie"
       }
-    }
-  },
-  "blacklisted_domains": {
-    "description": "域名黑名单",
-    "type": "list",
-    "default": [],
-    "hint": "在此列表中的域名将不会被自动解析。例如: [\"baidu.com\", \"google.com\"]",
-    "items": {
-      "type": "string"
     }
   }
 }

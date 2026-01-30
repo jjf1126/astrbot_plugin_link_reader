@@ -1,4 +1,4 @@
-aiohttp
 beautifulsoup4
+duckduckgo-search
+aiohttp
 lxml
-cssselect

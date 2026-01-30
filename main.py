@@ -1,263 +1,257 @@
 import re
 import asyncio
-import logging
-import json
+import traceback
+from typing import Optional, List, Dict
 from urllib.parse import urlparse
 
 import aiohttp
 from bs4 import BeautifulSoup
-from jinja2 import Template
+
+# 尝试导入 duckduckgo_search，如果未安装则降级处理
+try:
+    from duckduckgo_search import AsyncDDGS
+    HAS_DDG = True
+except ImportError:
+    HAS_DDG = False
 
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
+from astrbot.api import logger
 from astrbot.api.provider import ProviderRequest
-from astrbot.api import logger, AstrBotConfig
 
-@register("astrbot_plugin_link_context_reader", "YourName", "智能链接内容读取与LLM上下文增强插件", "1.0.0", "https://github.com/YourName/astrbot_plugin_link_context_reader")
-class LinkContextReader(Star):
-    def __init__(self, context: Context, config: AstrBotConfig):
+@register("astrbot_plugin_link_reader", "AstrBot_Developer", "一个强大的LLM上下文增强插件，自动解析链接内容。", "1.0.0", "https://github.com/your-repo/astrbot_plugin_link_reader")
+class LinkReaderPlugin(Star):
+    def __init__(self, context: Context, config: dict):
         super().__init__(context)
         self.config = config
         
-        # 编译 URL 匹配正则
-        self.url_pattern = re.compile(r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+(?:[/?]\S*)?')
-        
-        # 音乐平台域名特征
-        self.music_domains = ['music.163.com', 'y.qq.com', 'kugou.com', 'kuwo.cn']
-        # 社交平台域名特征
-        self.social_domains = ['zhihu.com', 'weibo.com', 'weibo.cn', 'xiaohongshu.com', 'lofter.com']
+        # 加载基础配置
+        self.general_config = self.config.get("general_config", {})
+        self.enable_plugin = self.general_config.get("enable_plugin", True)
+        self.max_length = self.general_config.get("max_content_length", 2000)
+        self.timeout = self.general_config.get("request_timeout", 15)
+        self.user_agent = self.general_config.get("user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        self.prompt_template = self.general_config.get("prompt_template", "\n【以下是链接的具体内容，请参考该内容进行回答】：\n{content}\n")
 
-    @filter.command("link_reader_status")
-    async def link_reader_status(self, event: AstrMessageEvent):
-        """查看当前链接解析服务的状态"""
-        status = "开启" if self.config.get("enable_auto_parse", True) else "关闭"
-        blacklist = self.config.get("blacklisted_domains", [])
-        
-        msg = (
-            f"🔗 链接解析服务状态: {status}\n"
-            f"🌐 当前黑名单域名数: {len(blacklist)}\n"
-            f"📝 内容截断长度: {self.config.get('max_content_length', 1500)}\n"
-            f"⏱️ 请求超时时间: {self.config.get('request_timeout', 10)}秒"
-        )
-        yield event.plain_result(msg)
+        # 加载音乐配置
+        self.music_config = self.config.get("music_feature", {})
+        self.enable_music_search = self.music_config.get("enable_search", True)
 
-    @filter.command("toggle_link_reader")
-    async def toggle_link_reader(self, event: AstrMessageEvent):
-        """开启或关闭链接自动解析功能"""
-        current_status = self.config.get("enable_auto_parse", True)
-        new_status = not current_status
-        self.config["enable_auto_parse"] = new_status
-        self.config.save_config() # 保存配置
+        # 加载平台 Cookie
+        self.platform_cookies = self.config.get("platform_cookies", {})
+
+        # URL 匹配正则
+        self.url_pattern = re.compile(r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+[/\w\.-]*\??[\w=&%\.-]*')
+
+    def _get_headers(self, domain: str = "") -> dict:
+        """根据域名获取对应的 Headers (包含 Cookie)"""
+        headers = {
+            "User-Agent": self.user_agent,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"
+        }
+
+        # 简单的域名匹配逻辑，映射配置中的 key
+        cookie_key = None
+        if "xiaohongshu" in domain: cookie_key = "xiaohongshu"
+        elif "zhihu" in domain: cookie_key = "zhihu"
+        elif "weibo" in domain: cookie_key = "weibo"
+        elif "bilibili" in domain: cookie_key = "bilibili"
+        elif "douyin" in domain: cookie_key = "douyin"
+        elif "tieba.baidu" in domain: cookie_key = "tieba"
+        elif "lofter" in domain: cookie_key = "lofter"
+
+        if cookie_key:
+            cookie_val = self.platform_cookies.get(cookie_key, "")
+            if cookie_val:
+                headers["Cookie"] = cookie_val
+                logger.debug(f"[LinkReader] 使用配置的 Cookie 访问: {domain}")
         
-        status_str = "已开启" if new_status else "已关闭"
-        yield event.plain_result(f"🔗 链接自动解析功能{status_str}。")
+        return headers
+
+    def _is_music_site(self, url: str) -> bool:
+        """判断是否为音乐网站"""
+        music_domains = ["music.163.com", "y.qq.com", "kugou.com", "kuwo.cn", "spotify.com"]
+        return any(domain in url for domain in music_domains)
+
+    def _clean_text(self, text: str) -> str:
+        """清洗提取的文本"""
+        # 移除多余空白字符
+        text = re.sub(r'\s+', ' ', text).strip()
+        # 截断
+        if len(text) > self.max_length:
+            text = text[:self.max_length] + "...(内容过长已截断)"
+        return text
+
+    async def _fetch_url_content(self, url: str) -> str:
+        """抓取并解析 URL 内容的核心逻辑"""
+        domain = urlparse(url).netloc
+        
+        # 1. 音乐链接特殊处理
+        if self._is_music_site(url) and self.enable_music_search and HAS_DDG:
+            return await self._handle_music_smart_search(url)
+        
+        # 2. 常规抓取 (包含社交媒体的 Cookie 处理)
+        headers = self._get_headers(domain)
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers, timeout=self.timeout, ssl=False) as response:
+                    if response.status != 200:
+                        return f"链接访问失败，状态码: {response.status}"
+                    
+                    # 获取编码
+                    content_type = response.headers.get('Content-Type', '').lower()
+                    charset = 'utf-8'
+                    if 'charset=' in content_type:
+                        charset = content_type.split('charset=')[-1]
+                    
+                    try:
+                        html = await response.text(encoding=charset, errors='ignore')
+                    except Exception:
+                        html = await response.text(errors='ignore')
+
+                    # 解析 HTML
+                    soup = BeautifulSoup(html, 'lxml')
+                    
+                    # 移除无用标签
+                    for tag in soup(['script', 'style', 'nav', 'footer', 'header', 'iframe', 'noscript']):
+                        tag.decompose()
+
+                    # 针对特定平台的简单提取优化 (示例)
+                    content = ""
+                    if "zhihu.com" in domain:
+                        # 尝试提取知乎正文
+                        main_content = soup.find('div', class_='RichContent-inner')
+                        if main_content:
+                            content = main_content.get_text(separator='\n', strip=True)
+                    elif "xiaohongshu.com" in domain:
+                        # 尝试提取小红书描述
+                        desc = soup.find('div', class_='desc') or soup.find('div', id='detail-desc')
+                        if desc:
+                            content = desc.get_text(separator='\n', strip=True)
+                    
+                    # 通用提取：如果特定提取失败或未定义
+                    if not content:
+                        # 优先提取 body
+                        body = soup.find('body')
+                        if body:
+                            content = body.get_text(separator='\n', strip=True)
+                        else:
+                            content = soup.get_text(separator='\n', strip=True)
+
+                    return self._clean_text(content)
+
+        except asyncio.TimeoutError:
+            return "抓取超时，无法获取内容。"
+        except Exception as e:
+            logger.error(f"[LinkReader] 抓取错误: {e}")
+            return f"解析链接时发生错误: {str(e)}"
+
+    async def _handle_music_smart_search(self, url: str) -> str:
+        """处理音乐链接：不爬取，而是通过 DDG 搜索歌词和评价"""
+        try:
+            # 第一步：简单尝试获取网页 Title 作为关键词
+            headers = {"User-Agent": self.user_agent}
+            keyword = ""
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers, timeout=5, ssl=False) as resp:
+                    if resp.status == 200:
+                        html = await resp.text(errors='ignore')
+                        soup = BeautifulSoup(html, 'lxml')
+                        if soup.title:
+                            keyword = soup.title.string.strip()
+            
+            if not keyword:
+                keyword = url # 降级使用 URL
+
+            # 清理 Title 中的杂项 (如 " - 网易云音乐")
+            keyword = re.sub(r'( - .*| \| .*)$', '', keyword)
+            logger.info(f"[LinkReader] 识别到音乐链接，提取关键词: {keyword}，开始搜索增强...")
+
+            # 第二步：使用 DuckDuckGo 搜索
+            search_query = f"{keyword} 歌词 评价 含义"
+            results_text = []
+            
+            async with AsyncDDGS() as ddgs:
+                async for r in ddgs.text(search_query, max_results=3):
+                    results_text.append(f"来源: {r['title']}\n摘要: {r['body']}")
+            
+            if results_text:
+                return f"【音乐链接智能解析】\n识别歌曲: {keyword}\n\n网络搜索结果:\n" + "\n---\n".join(results_text)
+            else:
+                return f"识别到音乐链接: {keyword}，但未搜索到相关详细信息。"
+
+        except Exception as e:
+            logger.warning(f"[LinkReader] 音乐智能解析失败: {e}")
+            return "音乐链接解析失败，请尝试直接询问。"
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
-        """
-        拦截 LLM 请求，检测 URL 并注入内容
-        """
-        # 1. 检查开关
-        if not self.config.get("enable_auto_parse", True):
+        """核心钩子：在 LLM 请求前拦截并注入链接内容"""
+        if not self.enable_plugin:
             return
 
-        # 2. 提取 URL
-        # 注意：这里优先检查 event.message_str，因为它包含原始用户消息
-        text = event.message_str or ""
+        # 获取用户文本
+        text = event.message_str
+        if not text:
+            return
+
+        # 查找链接
         urls = self.url_pattern.findall(text)
-        
         if not urls:
             return
-
-        # 只处理第一个 URL，避免过多请求
-        target_url = urls[0]
         
-        # 3. 检查黑名单
-        domain = urlparse(target_url).netloc
-        blacklist = self.config.get("blacklisted_domains", [])
-        if any(d in domain for d in blacklist):
-            logger.info(f"[LinkReader] Domain {domain} is blacklisted, skipping.")
-            return
+        target_url = urls[0] # 暂时只处理第一个链接，避免过长
+        logger.info(f"[LinkReader] 检测到链接，开始解析: {target_url}")
 
-        # 4. 路由处理与内容获取
-        logger.info(f"[LinkReader] Detected URL: {target_url}, start fetching...")
-        try:
-            parse_result = await self._fetch_and_parse(target_url)
+        # 发送处理中的提示（可选，这里不发送以保持无感，或根据需要发送）
+        # await event.send(event.plain_result("正在阅读链接内容...")) 
+
+        # 抓取内容
+        content = await self._fetch_url_content(target_url)
+
+        if content:
+            # 注入 Prompt
+            injection = self.prompt_template.format(content=content)
             
-            if not parse_result:
-                return
-
-            # 5. 渲染注入模板
-            template_str = self.config.get("injection_template", "")
-            if not template_str:
-                # 默认模板
-                template_str = "【系统检测到消息中包含链接，已自动读取内容】\n链接标题：{{title}}\n链接内容摘要：\n{{content}}\n\n请基于以上链接内容，回复用户的消息：\n"
+            # 这里选择追加到用户的 input_text 后面
+            # 也可以选择修改 system_prompt，取决于具体效果
+            # req.system_prompt += injection # 方式A
+            req.input_text += injection    # 方式B：更符合直觉，像用户贴了内容进去
             
-            tmpl = Template(template_str)
-            injection_text = tmpl.render(
-                title=parse_result.get("title", "无标题"),
-                url=target_url,
-                content=parse_result.get("content", "")
-            )
-
-            # 6. 注入到上下文
-            original_text = event.message_str or ""
-            
-            # 将注入文本和原话合并
-            new_content = f"{injection_text}\n\n[用户原话]: {original_text}"
-            
-            # 同时更新 event 和 req 中的内容
-            event.message_str = new_content
-            
-            # 尝试同步更新 req 里的消息列表（如果存在）
-            if hasattr(req, "messages") and req.messages:
-                for msg in reversed(req.messages):
-                    if msg.get('role') == 'user':
-                        msg['content'] = new_content
-                        break
-            logger.info(f"[LinkReader] Successfully injected content to event: {target_url}")
-
-        except Exception as e:
-            logger.error(f"[LinkReader] Error processing URL {target_url}: {e}")
-            # 出错不中断流程，让 LLM 继续处理原始消息
-
-    async def _fetch_and_parse(self, url: str) -> dict:
-        """核心获取与解析逻辑"""
-        timeout = self.config.get("request_timeout", 10)
-        ua = self.config.get("user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-        
-        domain = urlparse(url).netloc
-        cookies = {}
-        
-        # 平台特定 Cookie 处理
-        platform_cookies = self.config.get("platform_cookies", {})
-        if "zhihu" in domain and platform_cookies.get("zhihu_cookie"):
-            cookies["z_c0"] = platform_cookies["zhihu_cookie"]
-        elif "weibo" in domain and platform_cookies.get("weibo_cookie"):
-            cookies["SUB"] = platform_cookies["weibo_cookie"]
-        elif "xiaohongshu" in domain and platform_cookies.get("xiaohongshu_cookie"):
-            cookies["web_session"] = platform_cookies["xiaohongshu_cookie"]
-
-        features = self.config.get("features_switch", {})
-        
-        async with aiohttp.ClientSession(cookies=cookies) as session:
-            try:
-                async with session.get(url, headers={"User-Agent": ua}, timeout=timeout) as resp:
-                    if resp.status != 200:
-                        logger.warning(f"[LinkReader] Fetch failed: {resp.status}")
-                        return None
-                    
-                    # 针对部分编码问题，尝试自动检测，默认为 utf-8
-                    html = await resp.text(errors='ignore')
-                    
-                    # 路由分发
-                    if any(d in domain for d in self.music_domains):
-                        if not features.get("search_lyrics", True): return None
-                        return await self._parse_music(html, url)
-                    
-                    elif any(d in domain for d in self.social_domains):
-                        if not features.get("parse_social_media", True): return None
-                        return await self._parse_social(html, url)
-                    
-                    else:
-                        if not features.get("parse_generic_web", True): return None
-                        return await self._parse_generic(html, url)
-                        
-            except asyncio.TimeoutError:
-                logger.warning(f"[LinkReader] Fetch timeout for {url}")
-                return None
-            except Exception as e:
-                logger.error(f"[LinkReader] Request error: {e}")
-                return None
-
-    async def _parse_generic(self, html: str, url: str) -> dict:
-        """通用网页解析"""
-        soup = BeautifulSoup(html, 'lxml')
-        
-        # 移除干扰元素
-        for tag in soup(['script', 'style', 'nav', 'footer', 'iframe', 'noscript', 'svg']):
-            tag.decompose()
-            
-        title = soup.title.string.strip() if soup.title else "无标题"
-        
-        # 提取正文：优先提取 article 标签，否则提取所有 p 标签
-        content = ""
-        article = soup.find('article')
-        if article:
-            content = article.get_text(separator='\n', strip=True)
+            logger.info(f"[LinkReader] 已将链接内容注入上下文 (长度: {len(content)})")
         else:
-            # 简单的文本密度提取策略
-            paragraphs = [p.get_text(strip=True) for p in soup.find_all('p') if len(p.get_text(strip=True)) > 10]
-            content = "\n".join(paragraphs)
-            
-        return self._format_result(title, content)
+            logger.warning("[LinkReader] 未能提取到有效内容。")
 
-    async def _parse_social(self, html: str, url: str) -> dict:
-        """社交媒体解析 (基于 OpenGraph 协议优先)"""
-        soup = BeautifulSoup(html, 'lxml')
-        
-        title = "社交媒体分享"
-        content = ""
-        
-        # 尝试 OpenGraph 协议提取 (通用性强，适用于知乎、微博等渲染前的页面)
-        og_title = soup.find("meta", property="og:title")
-        if og_title:
-            title = og_title.get("content", "").strip()
+    @filter.command("link_debug")
+    async def link_debug(self, event: AstrMessageEvent, url: str):
+        """调试指令：直接返回抓取到的内容"""
+        if not url:
+            yield event.plain_result("请提供 URL，例如: /link_debug https://www.example.com")
+            return
             
-        og_desc = soup.find("meta", property="og:description")
-        if og_desc:
-            content = og_desc.get("content", "").strip()
+        yield event.plain_result(f"正在抓取: {url} ...")
+        
+        try:
+            content = await self._fetch_url_content(url)
+            yield event.plain_result(f"【抓取结果】(长度 {len(content)}):\n\n{content}")
+        except Exception as e:
+            yield event.plain_result(f"抓取发生异常: {e}")
+
+    @filter.command("link_status")
+    async def link_status(self, event: AstrMessageEvent):
+        """状态检查指令"""
+        status_msg = ["【Link Reader 插件状态】"]
+        status_msg.append(f"插件启用: {self.enable_plugin}")
+        status_msg.append(f"音乐搜索增强: {self.enable_music_search} (依赖库: {'已安装' if HAS_DDG else '未安装'})")
+        status_msg.append(f"最大截断长度: {self.max_length}")
+        
+        status_msg.append("\n【平台 Cookie 配置】")
+        platforms = ["xiaohongshu", "zhihu", "weibo", "bilibili", "douyin", "tieba", "lofter"]
+        for p in platforms:
+            cookie = self.platform_cookies.get(p, "")
+            state = "✅ 已配置" if cookie else "❌ 未配置 (使用游客模式)"
+            status_msg.append(f"- {p}: {state}")
             
-        # 如果 OpenGraph 没提取到内容，尝试 fallback 到 body text
-        if not content:
-            # 针对知乎的特定处理 (知乎有时将内容放在 script id="js-initialData" 中，这里仅做简单文本提取)
-            # 实际生产中可能需要更复杂的解析逻辑
-            content = soup.get_text(separator='\n', strip=True)[:500] + "..."
-            
-        return self._format_result(title, content)
-
-    async def _parse_music(self, html: str, url: str) -> dict:
-        """音乐链接解析"""
-        soup = BeautifulSoup(html, 'lxml')
-
-        # 1. 提取原始标题并清洗
-        raw_title = soup.title.string.strip() if soup.title else "未知音乐"
-        # 移除平台后缀，仅保留 歌手 - 歌曲名 部分
-        clean_title = raw_title.split('(豆瓣)')[0].split('- 网易云')[0].split('- QQ音乐')[0].strip()
-        
-        # 2. 尝试从 meta 标签获取更精准的关键词 (og:title 通常包含更纯净的 歌曲-歌手 信息)
-        og_title = soup.find("meta", property="og:title")
-        search_keyword = og_title.get("content", "") if og_title else clean_title
-        
-        # 3. 构造功能性内容
-        content = f"🎵 识别到音乐：{search_keyword}\n"
-        content += "---"
-    
-       # 构造精准搜索链接 (以 Google/百度 或 垂直社区为例)
-        # 使用 quote 确保 URL 编码安全
-        from urllib.parse import quote
-        encoded_query = quote(search_keyword)
-    
-        content += f"\n🔍 [搜索歌词]：https://www.google.com/search?q={encoded_query}+歌词"
-        content += f"\n💬 [查看评价]：https://search.douban.com/music/subject_search?search_text={encoded_query}"
-        content += f"\n🎧 [平台检索]：https://music.163.com/#/search/m/?s={encoded_query}"
-    
-        content += "\n\n(提示：由于版权保护，详细歌词与深度乐评请点击上方链接跳转查看)"
-
-        return self._format_result(search_keyword, content)
-        
-
-    def _format_result(self, title: str, content: str) -> dict:
-        """格式化并截断结果"""
-        max_len = self.config.get("max_content_length", 1500)
-        
-        if len(content) > max_len:
-            content = content[:max_len] + f"\n...(内容过长，已截断至{max_len}字)"
-            
-        # 清理多余空行
-        content = re.sub(r'\n\s*\n', '\n', content)
-        
-        return {
-            "title": title,
-            "content": content
-        }
+        yield event.plain_result("\n".join(status_msg))
