@@ -102,8 +102,8 @@ class LinkContextReader(Star):
 
             # 6. 注入到req.text
             # 也可以选择追加到 System Prompt 或 context 中，这里选择追加到 req.text
-            original_text = req.text or ""
-            req.text = f"{injection_text}\n\n[用户原话]: {original_text}"
+            original_query = req.query or ""
+            req.query = f"{injection_text}\n\n[用户原话]: {original_query}"
             
             logger.info(f"[LinkReader] Successfully injected content from {target_url}")
 
