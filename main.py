@@ -21,7 +21,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 from astrbot.api.provider import ProviderRequest
 
-@register("astrbot_plugin_link_reader", "AstrBot_Developer", "自动解析链接内容，支持社交平台截图及 geciyi.com 定向歌词搜索。", "1.3.0")
+@register("astrbot_plugin_link_reader", "AstrBot_Developer", "自动解析链接内容，支持社交平台截图及 geciyi.com 定向歌词搜索。", "1.3.1")
 class LinkReaderPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -65,12 +65,47 @@ class LinkReaderPlugin(Star):
 
     def _is_music_site(self, url: str) -> bool:
         """判断是否为音乐网站 (包含短链接)"""
-        music_domains = ["music.163.com", "y.qq.com", "kugou.com", "kuwo.cn", "163cn.tv", "url.cn"]
+        music_domains = ["music.163.com", "y.qq.com", "kugou.com", "kuwo.cn", "163cn.tv", "url.cn", "163.fm"]
         return any(domain in url for domain in music_domains)
+
+    def _contains_chinese(self, text: str) -> bool:
+        """检测文本是否包含汉字"""
+        for char in text:
+            if '\u4e00' <= char <= '\u9fff':
+                return True
+        return False
+
+    def _filter_lyrics(self, lyrics: str) -> str:
+        """参考 lyricnext 的深度清洗逻辑，去除元数据和时间轴"""
+        lines = lyrics.split('\n')
+        filtered_lines = []
+        for line in lines:
+            line = line.strip()
+            if not line: continue
+            # 去除时间标签
+            line = re.sub(r'\[\d+:\d+\.\d+\]', '', line).strip()
+            if not line or line.startswith('['): continue
+            
+            # 过滤掉信息行（作词、作曲、标题等）
+            if (':' in line or '：' in line or ' - ' in line or 
+                ('(' in line and ')' in line) or re.match(r'^[A-Za-z\s:]+$', line)):
+                continue
+            
+            # 汉字歌词空格拆分逻辑
+            if ' ' in line and self._contains_chinese(line):
+                parts = [part.strip() for part in line.split(' ') if part.strip()]
+                if all(len(part) < 20 and not any(c in part for c in ':：()[]{}') for part in parts):
+                    filtered_lines.extend(parts)
+                    continue
+            
+            filtered_lines.append(line)
+        
+        # 过滤数字行和短行
+        final_lines = [l for l in filtered_lines if len(l) > 1 and not l.isdigit()]
+        return '\n'.join(final_lines)
 
     def _clean_text(self, text: str) -> str:
         """核心清洗逻辑：剔除无关的备案信息、页脚、法律条款等默认内容"""
-        # 按行处理
         lines = text.split('\n')
         # 无关信息黑名单
         blacklist = [
@@ -88,7 +123,6 @@ class LinkReaderPlugin(Star):
             cleaned_lines.append(line)
             
         result = '\n'.join(cleaned_lines)
-        # 移除行内多余空格
         result = re.sub(r' +', ' ', result).strip()
         
         if len(result) > self.max_length:
@@ -96,7 +130,7 @@ class LinkReaderPlugin(Star):
         return result
 
     async def _search_geciyi(self, song_name: str) -> Optional[str]:
-        """直接在 geciyi.com/zh-Hans/ 搜索歌词"""
+        """直接在 geciyi.com 搜索并点击第一个“查看歌词”选项"""
         search_url = f"https://geciyi.com/zh-Hans/search?q={quote(song_name)}"
         headers = {"User-Agent": self.user_agent}
         try:
@@ -106,32 +140,33 @@ class LinkReaderPlugin(Star):
                     html = await resp.text()
                     soup = BeautifulSoup(html, 'lxml')
                     
-                    # 寻找搜索结果列表中的第一个歌词页面链接
+                    # 寻找搜索结果中的第一个“查看歌词”链接
                     target_link = None
-                    # 遍历所有链接，寻找包含曲名且不是搜索/分类路径的链接
                     for a in soup.find_all('a', href=True):
-                        href = a['href']
-                        if "/zh-Hans/" in href and "search" not in href and song_name.lower() in a.get_text().lower():
-                            target_link = href if href.startswith("http") else "https://geciyi.com" + href
+                        if "查看歌词" in a.get_text():
+                            target_link = a['href']
+                            if not target_link.startswith("http"):
+                                target_link = "https://geciyi.com" + target_link
                             break
                     
-                    if not target_link:
-                        # 降级方案：获取正文区域第一个结果链接
-                        main_content = soup.find('main') or soup.find('body')
-                        for a in main_content.find_all('a', href=True):
-                            href = a['href']
-                            if "/zh-Hans/" in href and "search" not in href:
-                                target_link = href if href.startswith("http") else "https://geciyi.com" + href
-                                break
-
                     if target_link:
                         logger.info(f"[LinkReader] 正在访问歌词详情页: {target_link}")
                         async with session.get(target_link, headers=headers, timeout=10) as l_resp:
                             l_soup = BeautifulSoup(await l_resp.text(), 'lxml')
-                            # 移除详情页干扰元素
-                            for tag in l_soup(['script', 'style', 'nav', 'footer', 'header', 'aside']): tag.decompose()
-                            # 提取并清洗歌词正文
-                            return self._clean_text(l_soup.get_text(separator='\n', strip=True))
+                            # 尝试定位歌词主容器
+                            content_container = l_soup.find('article') or l_soup.find('div', class_='lyric-content')
+                            
+                            if content_container:
+                                for tag in content_container(['script', 'style', 'nav', 'footer', 'header', 'aside', 'iframe', 'button']):
+                                    tag.decompose()
+                                raw_text = content_container.get_text(separator='\n', strip=True)
+                            else:
+                                for tag in l_soup(['script', 'style', 'nav', 'footer', 'header', 'aside', 'iframe', 'button']):
+                                    tag.decompose()
+                                raw_text = l_soup.get_text(separator='\n', strip=True)
+                                
+                            # 使用深度过滤逻辑处理歌词
+                            return self._filter_lyrics(raw_text)
         except Exception as e:
             logger.error(f"[LinkReader] geciyi.com 搜索失败: {e}")
         return None
@@ -144,17 +179,15 @@ class LinkReaderPlugin(Star):
                     soup = BeautifulSoup(await resp.text(errors='ignore'), 'lxml')
                     title = soup.title.string.strip() if soup.title else url
             
-            # 清理标题得到纯净曲名
             song_name = re.sub(r'( - 网易云音乐| - QQ音乐| - 酷狗音乐| - 酷我音乐|\|.*)$', '', title).strip()
-            song_name = re.sub(r' - .*$', '', song_name).strip() # 只要曲名
+            song_name = re.sub(r' - .*$', '', song_name).strip() 
             
             logger.info(f"[LinkReader] 正在定向搜索歌词: {song_name}")
-            
             content = await self._search_geciyi(song_name)
             
             if content:
                 return f"【歌词解析: {song_name}】\n数据来源: geciyi.com\n\n{content}"
-            return f"识别到歌曲《{song_name}》，但未能从 geciyi.com 检索到纯净内容。"
+            return f"识别到歌曲《{song_name}》，但未能从 geciyi.com 获取正确歌词。"
         except Exception as e:
             return f"音乐解析异常: {str(e)}"
 
@@ -177,21 +210,19 @@ class LinkReaderPlugin(Star):
             return None, None
 
     async def _fetch_url_content(self, url: str):
-        """网页抓取分流"""
-        # 1. 音乐站点识别
+        """网页抓取入口"""
         if self._is_music_site(url):
             return await self._handle_music_smart_search(url), None
         
-        # 2. 社交平台识别 (带截图)
         domain = urlparse(url).netloc
         social_platforms = ["xiaohongshu.com", "zhihu.com", "weibo.com", "bilibili.com", "douyin.com", "lofter.com"]
         if any(sp in domain for sp in social_platforms) and HAS_PLAYWRIGHT:
             html, screenshot = await self._get_screenshot_and_content(url)
             if html:
                 soup = BeautifulSoup(html, 'lxml')
-                for tag in soup(['script', 'style', 'nav', 'footer', 'header', 'aside']): tag.decompose()
+                for tag in soup(['script', 'style', 'nav', 'footer', 'header', 'aside', 'iframe']): tag.decompose()
                 
-                # 小红书正文精准提取
+                # 特定平台内容提取优化
                 if "xiaohongshu.com" in url:
                     content_div = soup.find(class_=re.compile(r'desc|note-content|text'))
                     content = content_div.get_text(separator='\n', strip=True) if content_div else soup.get_text(separator='\n', strip=True)
@@ -200,7 +231,7 @@ class LinkReaderPlugin(Star):
                 
                 return self._clean_text(content), screenshot
 
-        # 3. 常规抓取
+        # 常规网页抓取
         headers = self._get_headers(domain)
         try:
             async with aiohttp.ClientSession() as session:
@@ -213,7 +244,7 @@ class LinkReaderPlugin(Star):
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
-        """拦截请求并注入内容"""
+        """拦截请求并注入 Prompt"""
         if not self.enable_plugin: return
         urls = self.url_pattern.findall(event.message_str)
         if not urls: return
@@ -222,16 +253,15 @@ class LinkReaderPlugin(Star):
         content, screenshot_base64 = await self._fetch_url_content(target_url)
 
         if content:
-            # 注入清洗后的正文
+            # 修复 input_text 属性不存在的问题，使用 req.prompt
             req.prompt += self.prompt_template.format(content=content)
-            # 注入截图 (如果存在)
             if screenshot_base64:
                 req.prompt += f"\n(附带页面截图参考)\n图片：data:image/jpeg;base64,{screenshot_base64}"
             logger.info(f"[LinkReader] 内容已成功注入 Prompt")
 
     @filter.command("link_debug")
     async def link_debug(self, event: AstrMessageEvent, url: str):
-        """调试：查看清洗后的内容"""
+        """调试指令"""
         if not url: return
         yield event.plain_result(f"正在进行深度清洗解析: {url}...")
         content, screenshot = await self._fetch_url_content(url)
@@ -241,17 +271,10 @@ class LinkReaderPlugin(Star):
 
     @filter.command("link_status")
     async def link_status(self, event: AstrMessageEvent):
-        """查看插件详尽状态"""
+        """状态检查指令"""
         status_msg = ["【Link Reader 插件状态】"]
         status_msg.append(f"插件启用: {'✅' if self.enable_plugin else '❌'}")
-        status_msg.append(f"歌词搜索: ✅ 定向 geciyi.com")
-        status_msg.append(f"截图支持: {'✅ 已就绪 (Playwright)' if HAS_PLAYWRIGHT else '❌ 未安装'}")
-        status_msg.append(f"内容限制: {self.max_length} 字符")
-        
-        status_msg.append("\n【平台 Cookie 配置】")
-        platforms = ["xiaohongshu", "zhihu", "weibo", "bilibili", "douyin", "tieba", "lofter"]
-        for p in platforms:
-            cookie = self.platform_cookies.get(p, "")
-            status_msg.append(f"- {p}: {'✅ 已配置' if cookie else '❌ 游客模式'}")
-            
+        status_msg.append(f"歌词搜索: ✅ 定向 geciyi.com (查看歌词选项)")
+        status_msg.append(f"截图支持: {'✅ 已就绪' if HAS_PLAYWRIGHT else '❌ 未安装'}")
+        status_msg.append(f"最大长度: {self.max_length}")
         yield event.plain_result("\n".join(status_msg))
