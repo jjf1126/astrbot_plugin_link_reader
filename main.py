@@ -21,7 +21,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 from astrbot.api.provider import ProviderRequest
 
-@register("astrbot_plugin_link_reader", "AstrBot_Developer", "自动解析链接内容，支持社交平台截图及多源音乐API歌词深度检索。", "1.2.5")
+@register("astrbot_plugin_link_reader", "AstrBot_Developer", "自动解析链接内容，支持社交平台截图及 geciyi.com 定向歌词搜索。", "1.3.0")
 class LinkReaderPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -34,10 +34,6 @@ class LinkReaderPlugin(Star):
         self.timeout = self.general_config.get("request_timeout", 15)
         self.user_agent = self.general_config.get("user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         self.prompt_template = self.general_config.get("prompt_template", "\n【以下是链接的具体内容，请参考该内容进行回答】：\n{content}\n")
-
-        # 加载音乐配置
-        self.music_config = self.config.get("music_feature", {})
-        self.enable_music_search = self.music_config.get("enable_search", True)
 
         # 加载平台 Cookie
         self.platform_cookies = self.config.get("platform_cookies", {})
@@ -72,144 +68,95 @@ class LinkReaderPlugin(Star):
         music_domains = ["music.163.com", "y.qq.com", "kugou.com", "kuwo.cn", "163cn.tv", "url.cn"]
         return any(domain in url for domain in music_domains)
 
-    def _contains_chinese(self, text: str) -> bool:
-        """检测文本是否包含汉字"""
-        for char in text:
-            if '\u4e00' <= char <= '\u9fff':
-                return True
-        return False
-
-    def _filter_lyrics(self, lyrics: str) -> str:
-        """深度清洗歌词，去除元数据和时间轴"""
-        lines = lyrics.split('\n')
-        filtered_lines = []
+    def _clean_text(self, text: str) -> str:
+        """核心清洗逻辑：剔除无关的备案信息、页脚、法律条款等默认内容"""
+        # 按行处理
+        lines = text.split('\n')
+        # 无关信息黑名单
+        blacklist = [
+            "沪ICP备", "公网安备", "经营许可证", "版权所有", "©", "Copyright", 
+            "地址：", "电话：", "商务合作", "违法不良信息", "加载中", "立即体验",
+            "下载APP", "打开APP", "营业执照", "医疗器械", "网信算备"
+        ]
+        
+        cleaned_lines = []
         for line in lines:
             line = line.strip()
-            if not line: continue
-            # 去除时间标签
-            line = re.sub(r'\[\d+:\d+\.\d+\]', '', line).strip()
-            if not line or line.startswith('['): continue
-            
-            # 过滤掉信息行（作词、作曲、标题等）
-            if (':' in line or '：' in line or ' - ' in line or 
-                ('(' in line and ')' in line) or re.match(r'^[A-Za-z\s:]+$', line)):
+            # 跳过空行、过短的行或包含黑名单内容的行
+            if not line or len(line) < 2 or any(kw in line for kw in blacklist):
                 continue
+            cleaned_lines.append(line)
             
-            # 汉字歌词空格拆分
-            if ' ' in line and self._contains_chinese(line):
-                parts = [part.strip() for part in line.split(' ') if part.strip()]
-                if all(len(part) < 20 and not any(c in part for c in ':：()[]{}') for part in parts):
-                    filtered_lines.extend(parts)
-                    continue
-            
-            filtered_lines.append(line)
+        result = '\n'.join(cleaned_lines)
+        # 移除行内多余空格
+        result = re.sub(r' +', ' ', result).strip()
         
-        # 过滤数字行和短行
-        final_lines = [l for l in filtered_lines if len(l) > 1 and not l.isdigit()]
-        return '\n'.join(final_lines)
+        if len(result) > self.max_length:
+            result = result[:self.max_length] + "...(内容过长已截断)"
+        return result
 
-    async def _search_netease(self, song_name: str) -> Optional[str]:
-        """异步网易云 API 检索"""
-        headers = {'User-Agent': self.user_agent, 'Referer': 'https://music.163.com/'}
+    async def _search_geciyi(self, song_name: str) -> Optional[str]:
+        """直接在 geciyi.com/zh-Hans/ 搜索歌词"""
+        search_url = f"https://geciyi.com/zh-Hans/search?q={quote(song_name)}"
+        headers = {"User-Agent": self.user_agent}
         try:
             async with aiohttp.ClientSession() as session:
-                url = f"https://music.163.com/api/search/get?s={quote(song_name + ' 歌词')}&type=1&limit=5"
-                async with session.get(url, headers=headers) as resp:
-                    data = await resp.json()
-                    songs = data.get('result', {}).get('songs', [])
-                    if songs:
-                        l_url = f"https://music.163.com/api/song/lyric?id={songs[0]['id']}&lv=1&kv=1&tv=-1"
-                        async with session.get(l_url, headers=headers) as l_resp:
-                            l_data = await l_resp.json()
-                            return l_data.get('lrc', {}).get('lyric')
-        except: pass
-        return None
+                async with session.get(search_url, headers=headers, timeout=10) as resp:
+                    if resp.status != 200: return None
+                    html = await resp.text()
+                    soup = BeautifulSoup(html, 'lxml')
+                    
+                    # 寻找搜索结果列表中的第一个歌词页面链接
+                    target_link = None
+                    # 遍历所有链接，寻找包含曲名且不是搜索/分类路径的链接
+                    for a in soup.find_all('a', href=True):
+                        href = a['href']
+                        if "/zh-Hans/" in href and "search" not in href and song_name.lower() in a.get_text().lower():
+                            target_link = href if href.startswith("http") else "https://geciyi.com" + href
+                            break
+                    
+                    if not target_link:
+                        # 降级方案：获取正文区域第一个结果链接
+                        main_content = soup.find('main') or soup.find('body')
+                        for a in main_content.find_all('a', href=True):
+                            href = a['href']
+                            if "/zh-Hans/" in href and "search" not in href:
+                                target_link = href if href.startswith("http") else "https://geciyi.com" + href
+                                break
 
-    async def _search_qq(self, song_name: str) -> Optional[str]:
-        """异步 QQ 音乐 API 检索"""
-        headers = {'User-Agent': self.user_agent, 'Referer': 'https://y.qq.com/'}
-        try:
-            async with aiohttp.ClientSession() as session:
-                search_data = {"req_0": {"method": "DoSearchForQQMusicDesktop", "module": "music.search.SearchCgiService", "param": {"query": song_name + " 歌词", "page_num": 1, "num_per_page": 5, "search_type": 0}}}
-                url = f"https://u.y.qq.com/cgi-bin/musicu.fcg?data={quote(json.dumps(search_data))}"
-                async with session.get(url, headers=headers) as resp:
-                    data = await resp.json()
-                    songs = data.get('req_0', {}).get('data', {}).get('body', {}).get('song', {}).get('list', [])
-                    if songs:
-                        l_url = f"https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg?songmid={songs[0]['mid']}&format=json&nobase64=1"
-                        async with session.get(l_url, headers=headers) as l_resp:
-                            l_data = await l_resp.json()
-                            if 'lyric' in l_data:
-                                return base64.b64decode(l_data['lyric']).decode('utf-8')
-        except: pass
-        return None
-
-    async def _search_kugou(self, song_name: str) -> Optional[str]:
-        """异步酷狗 API 检索"""
-        headers = {'User-Agent': self.user_agent, 'Referer': 'https://www.kugou.com/'}
-        try:
-            async with aiohttp.ClientSession() as session:
-                url = "http://mobilecdn.kugou.com/api/v3/search/song"
-                params = {'format': 'json', 'keyword': song_name + " 歌词", 'page': 1, 'pagesize': 5}
-                async with session.get(url, params=params, headers=headers) as resp:
-                    data = await resp.json()
-                    songs = data.get('data', {}).get('info', [])
-                    if songs:
-                        h = songs[0].get('hash')
-                        l_url = f"http://lyrics.kugou.com/search?ver=1&man=yes&client=mobi&hash={h}"
-                        async with session.get(l_url, headers=headers) as ls_resp:
-                            ls_data = await ls_resp.json()
-                            if ls_data.get('candidates'):
-                                c = ls_data['candidates'][0]
-                                d_url = f"http://lyrics.kugou.com/download?ver=1&client=pc&id={c['id']}&accesskey={c['accesskey']}&fmt=lrc&charset=utf8"
-                                async with session.get(d_url, headers=headers) as d_resp:
-                                    d_data = await d_resp.json()
-                                    if 'content' in d_data:
-                                        return base64.b64decode(d_data['content']).decode('utf-8')
-        except: pass
+                    if target_link:
+                        logger.info(f"[LinkReader] 正在访问歌词详情页: {target_link}")
+                        async with session.get(target_link, headers=headers, timeout=10) as l_resp:
+                            l_soup = BeautifulSoup(await l_resp.text(), 'lxml')
+                            # 移除详情页干扰元素
+                            for tag in l_soup(['script', 'style', 'nav', 'footer', 'header', 'aside']): tag.decompose()
+                            # 提取并清洗歌词正文
+                            return self._clean_text(l_soup.get_text(separator='\n', strip=True))
+        except Exception as e:
+            logger.error(f"[LinkReader] geciyi.com 搜索失败: {e}")
         return None
 
     async def _handle_music_smart_search(self, url: str) -> str:
-        """核心音乐解析：API 轮询搜索真实歌词"""
+        """音乐解析入口：提取曲名并定向搜索"""
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, headers={"User-Agent": self.user_agent}, timeout=5) as resp:
                     soup = BeautifulSoup(await resp.text(errors='ignore'), 'lxml')
                     title = soup.title.string.strip() if soup.title else url
             
+            # 清理标题得到纯净曲名
             song_name = re.sub(r'( - 网易云音乐| - QQ音乐| - 酷狗音乐| - 酷我音乐|\|.*)$', '', title).strip()
-            song_name = re.sub(r' - .*$', '', song_name).strip() # 仅保留曲名
+            song_name = re.sub(r' - .*$', '', song_name).strip() # 只要曲名
             
-            logger.info(f"[LinkReader] 正在 API 检索歌词: {song_name}")
+            logger.info(f"[LinkReader] 正在定向搜索歌词: {song_name}")
             
-            # 轮询各平台
-            raw_lyric = (await self._search_netease(song_name) or 
-                         await self._search_qq(song_name) or 
-                         await self._search_kugou(song_name))
+            content = await self._search_geciyi(song_name)
             
-            if raw_lyric:
-                clean_lyric = self._filter_lyrics(raw_lyric)
-                return f"【音乐解析】\n歌曲: {song_name}\n\n歌词正文:\n{clean_lyric[:1500]}"
-            return f"识别到歌曲《{song_name}》，但未能检索到有效的纯净歌词。"
+            if content:
+                return f"【歌词解析: {song_name}】\n数据来源: geciyi.com\n\n{content}"
+            return f"识别到歌曲《{song_name}》，但未能从 geciyi.com 检索到纯净内容。"
         except Exception as e:
             return f"音乐解析异常: {str(e)}"
-
-    def _clean_text(self, text: str) -> str:
-        """清洗文本，剔除无关信息和法律条款"""
-        lines = text.split('\n')
-        blacklist = ["沪ICP备", "公网安备", "经营许可证", "版权所有", "©", "Copyright", "地址：", "电话：", "商务合作", "违法不良信息"]
-        
-        cleaned_lines = []
-        for line in lines:
-            line = line.strip()
-            if not line or any(kw in line for kw in blacklist): continue
-            cleaned_lines.append(line)
-            
-        text = '\n'.join(cleaned_lines)
-        text = re.sub(r'\s+', ' ', text).strip()
-        if len(text) > self.max_length:
-            text = text[:self.max_length] + "...(内容过长已截断)"
-        return text
 
     async def _get_screenshot_and_content(self, url: str):
         """Playwright 浏览器自动化截图"""
@@ -219,7 +166,7 @@ class LinkReaderPlugin(Star):
                 browser = await p.chromium.launch(headless=True)
                 context = await browser.new_context(user_agent=self.user_agent, viewport={'width': 1280, 'height': 800})
                 page = await context.new_page()
-                await page.goto(url, wait_until='networkidle', timeout=30000) 
+                await page.goto(url, wait_until='networkidle', timeout=30000)
                 content = await page.content()
                 screenshot_bytes = await page.screenshot(type='jpeg', quality=80)
                 screenshot_base64 = base64.b64encode(screenshot_bytes).decode('utf-8')
@@ -230,18 +177,21 @@ class LinkReaderPlugin(Star):
             return None, None
 
     async def _fetch_url_content(self, url: str):
-        """抓取逻辑入口"""
+        """网页抓取分流"""
+        # 1. 音乐站点识别
         if self._is_music_site(url):
             return await self._handle_music_smart_search(url), None
         
+        # 2. 社交平台识别 (带截图)
+        domain = urlparse(url).netloc
         social_platforms = ["xiaohongshu.com", "zhihu.com", "weibo.com", "bilibili.com", "douyin.com", "lofter.com"]
-        if any(sp in urlparse(url).netloc for sp in social_platforms) and HAS_PLAYWRIGHT:
+        if any(sp in domain for sp in social_platforms) and HAS_PLAYWRIGHT:
             html, screenshot = await self._get_screenshot_and_content(url)
             if html:
                 soup = BeautifulSoup(html, 'lxml')
                 for tag in soup(['script', 'style', 'nav', 'footer', 'header', 'aside']): tag.decompose()
                 
-                # 针对小红书优化
+                # 小红书正文精准提取
                 if "xiaohongshu.com" in url:
                     content_div = soup.find(class_=re.compile(r'desc|note-content|text'))
                     content = content_div.get_text(separator='\n', strip=True) if content_div else soup.get_text(separator='\n', strip=True)
@@ -250,8 +200,8 @@ class LinkReaderPlugin(Star):
                 
                 return self._clean_text(content), screenshot
 
-        # 常规抓取
-        headers = self._get_headers(urlparse(url).netloc)
+        # 3. 常规抓取
+        headers = self._get_headers(domain)
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, headers=headers, timeout=10, ssl=False) as resp:
@@ -259,11 +209,11 @@ class LinkReaderPlugin(Star):
                     for tag in soup(['script', 'style', 'nav', 'footer', 'header']): tag.decompose()
                     return self._clean_text(soup.get_text(separator='\n', strip=True)), None
         except Exception as e:
-            return f"解析出错: {str(e)}", None
+            return f"网页解析出错: {str(e)}", None
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
-        """核心钩子：注入内容及截图到 prompt"""
+        """拦截请求并注入内容"""
         if not self.enable_plugin: return
         urls = self.url_pattern.findall(event.message_str)
         if not urls: return
@@ -272,36 +222,36 @@ class LinkReaderPlugin(Star):
         content, screenshot_base64 = await self._fetch_url_content(target_url)
 
         if content:
-            # 修复 input_text 错误，统一使用 req.prompt
+            # 注入清洗后的正文
             req.prompt += self.prompt_template.format(content=content)
+            # 注入截图 (如果存在)
             if screenshot_base64:
-                req.prompt += f"\n(页面截图参考)\n图片：data:image/jpeg;base64,{screenshot_base64}"
-            logger.info(f"[LinkReader] 内容已成功注入上下文")
+                req.prompt += f"\n(附带页面截图参考)\n图片：data:image/jpeg;base64,{screenshot_base64}"
+            logger.info(f"[LinkReader] 内容已成功注入 Prompt")
 
     @filter.command("link_debug")
     async def link_debug(self, event: AstrMessageEvent, url: str):
-        """调试模式"""
+        """调试：查看清洗后的内容"""
         if not url: return
-        yield event.plain_result(f"正在进行深度解析: {url}...")
+        yield event.plain_result(f"正在进行深度清洗解析: {url}...")
         content, screenshot = await self._fetch_url_content(url)
-        msg = f"【抓取预览】:\n{content}"
+        msg = f"【清洗后的正文】:\n{content}"
         if screenshot: msg += "\n\n(截图获取成功)"
         yield event.plain_result(msg)
 
     @filter.command("link_status")
     async def link_status(self, event: AstrMessageEvent):
-        """完整状态检查"""
+        """查看插件详尽状态"""
         status_msg = ["【Link Reader 插件状态】"]
-        status_msg.append(f"插件总开关: {'✅ 开启' if self.enable_plugin else '❌ 关闭'}")
-        status_msg.append(f"音乐解析增强: ✅ 已就绪 (网易/QQ/酷狗 API)")
-        status_msg.append(f"截图功能支持: {'✅ 已就绪 (Playwright)' if HAS_PLAYWRIGHT else '❌ 未就绪'}")
-        status_msg.append(f"最大内容长度: {self.max_length} 字符")
+        status_msg.append(f"插件启用: {'✅' if self.enable_plugin else '❌'}")
+        status_msg.append(f"歌词搜索: ✅ 定向 geciyi.com")
+        status_msg.append(f"截图支持: {'✅ 已就绪 (Playwright)' if HAS_PLAYWRIGHT else '❌ 未安装'}")
+        status_msg.append(f"内容限制: {self.max_length} 字符")
         
-        status_msg.append("\n【社交平台 Cookie 状态】")
+        status_msg.append("\n【平台 Cookie 配置】")
         platforms = ["xiaohongshu", "zhihu", "weibo", "bilibili", "douyin", "tieba", "lofter"]
         for p in platforms:
             cookie = self.platform_cookies.get(p, "")
-            state = "✅ 已配置" if cookie else "❌ 未配置 (游客模式)"
-            status_msg.append(f"- {p}: {state}")
+            status_msg.append(f"- {p}: {'✅ 已配置' if cookie else '❌ 游客模式'}")
             
         yield event.plain_result("\n".join(status_msg))
