@@ -143,7 +143,7 @@ class LinkReaderPlugin(Star):
                     # 寻找搜索结果中的第一个“查看歌词”链接
                     target_link = None
                     for a in soup.find_all('a', href=True):
-                        if "查看歌词" in a.get_text():
+                        if "查看歌詞" in a.get_text():
                             target_link = a['href']
                             if not target_link.startswith("http"):
                                 target_link = "https://geciyi.com" + target_link
