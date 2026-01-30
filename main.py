@@ -26,7 +26,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 from astrbot.api.provider import ProviderRequest
 
-@register("astrbot_plugin_link_reader", "AstrBot_Developer", "一个强大的LLM上下文增强插件，自动解析链接内容并支持社交平台截图。", "1.1.0", "https://github.com/your-repo/astrbot_plugin_link_reader")
+@register("astrbot_plugin_link_reader", "AstrBot_Developer", "一个强大的LLM上下文增强插件，自动解析链接内容并支持社交平台截图及多源歌词搜索。", "1.2.0", "https://github.com/your-repo/astrbot_plugin_link_reader")
 class LinkReaderPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -102,7 +102,6 @@ class LinkReaderPlugin(Star):
                     viewport={'width': 1280, 'height': 800}
                 )
                 page = await context.new_page()
-                # 针对社交平台增加超时时间
                 await page.goto(url, wait_until='networkidle', timeout=30000) 
                 
                 content = await page.content()
@@ -119,8 +118,8 @@ class LinkReaderPlugin(Star):
         """抓取并解析内容的主逻辑"""
         domain = urlparse(url).netloc
         
-        # 1. 音乐链接：直接走搜索增强，不截图
-        if self._is_music_site(url) and self.enable_music_search and HAS_DDG:
+        # 1. 音乐链接：直接走搜索增强
+        if self._is_music_site(url) and self.enable_music_search:
             music_text = await self._handle_music_smart_search(url)
             return music_text, None
         
@@ -148,7 +147,7 @@ class LinkReaderPlugin(Star):
                 
                 return self._clean_text(content), screenshot
 
-        # 3. 常规网页：aiohttp 抓取内容，不截图
+        # 3. 常规网页：aiohttp 抓取
         headers = self._get_headers(domain)
         try:
             async with aiohttp.ClientSession() as session:
@@ -168,8 +167,40 @@ class LinkReaderPlugin(Star):
             logger.error(f"[LinkReader] 常规抓取错误: {e}")
             return f"解析链接时发生错误: {str(e)}", None
 
+    async def _search_jigeci(self, keyword: str) -> Optional[str]:
+        """从 jigeci.cn 备选搜索歌词"""
+        try:
+            search_url = f"https://jigeci.cn/search?q={keyword}"
+            headers = {"User-Agent": self.user_agent}
+            async with aiohttp.ClientSession() as session:
+                async with session.get(search_url, headers=headers, timeout=10) as resp:
+                    if resp.status != 200: return None
+                    html = await resp.text()
+                    soup = BeautifulSoup(html, 'lxml')
+                    # 查找第一个搜索结果链接
+                    first_result = soup.find('div', class_='search-result-item')
+                    if not first_result: return None
+                    link = first_result.find('a')
+                    if not link or not link.get('href'): return None
+                    
+                    target_url = link['href']
+                    if not target_url.startswith('http'):
+                        target_url = "https://jigeci.cn" + target_url
+                        
+                    async with session.get(target_url, headers=headers, timeout=10) as detail_resp:
+                        if detail_resp.status != 200: return None
+                        detail_html = await detail_resp.text()
+                        detail_soup = BeautifulSoup(detail_html, 'lxml')
+                        lyric_div = detail_soup.find('div', class_='lyric-content') or detail_soup.find('div', id='lyric-content')
+                        if lyric_div:
+                            return lyric_div.get_text(separator='\n', strip=True)
+            return None
+        except Exception as e:
+            logger.debug(f"[LinkReader] jigeci 搜索失败: {e}")
+            return None
+
     async def _handle_music_smart_search(self, url: str) -> str:
-        """处理音乐链接：通过搜索获取具体歌词"""
+        """处理音乐链接：优先 DDG 搜索，失败则尝试 jigeci.cn"""
         try:
             headers = {"User-Agent": self.user_agent}
             keyword = ""
@@ -184,24 +215,35 @@ class LinkReaderPlugin(Star):
             if not keyword:
                 keyword = url
 
-            # 优化关键词提取：保留歌曲名和歌手
             keyword = re.sub(r'( - 网易云音乐| - QQ音乐| - 酷狗音乐| - 酷我音乐|\|.*)$', '', keyword).strip()
-            logger.info(f"[LinkReader] 识别音乐链接，关键词: {keyword}，搜索歌词中...")
+            logger.info(f"[LinkReader] 识别音乐链接，关键词: {keyword}")
 
-            search_query = f"{keyword} 歌词"
             results_text = []
             
-            # 适配最新版 duckduckgo_search API
+            # 1. 尝试 DuckDuckGo 搜索
             if HAS_DDG:
-                with DDGS() as ddgs:
-                    results = ddgs.text(search_query, max_results=3)
-                    for r in results:
-                        results_text.append(f"来源: {r['title']}\n摘要: {r['body']}")
+                try:
+                    with DDGS() as ddgs:
+                        results = ddgs.text(f"{keyword} 歌词", max_results=3)
+                        for r in results:
+                            results_text.append(f"来源: {r['title']}\n摘要: {r['body']}")
+                except Exception as e:
+                    logger.debug(f"DDG 搜索发生错误: {e}")
+
+            # 2. 如果 DDG 结果不理想，尝试从 jigeci.cn 获取精确歌词
+            jigeci_lyric = await self._search_jigeci(keyword)
+            
+            final_content = f"【音乐链接智能解析】\n识别歌曲: {keyword}\n\n"
+            if jigeci_lyric:
+                final_content += f"【精确歌词内容】:\n{jigeci_lyric}\n\n"
             
             if results_text:
-                return f"【音乐链接智能解析】\n识别歌曲: {keyword}\n\n网络搜索歌词结果:\n" + "\n---\n".join(results_text)
-            else:
-                return f"识别到音乐链接: {keyword}，但未在搜索结果中找到具体歌词。"
+                final_content += "【网络搜索相关参考】:\n" + "\n---\n".join(results_text)
+            
+            if not jigeci_lyric and not results_text:
+                return f"识别到音乐链接: {keyword}，但未在搜索结果或歌词库中找到具体信息。"
+            
+            return final_content
 
         except Exception as e:
             logger.warning(f"[LinkReader] 音乐智能解析失败: {e}")
@@ -209,65 +251,43 @@ class LinkReaderPlugin(Star):
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
-        """核心钩子：拦截请求并注入链接内容及图片"""
-        if not self.enable_plugin:
-            return
+        """核心钩子"""
+        if not self.enable_plugin: return
 
         text = event.message_str
-        if not text:
-            return
+        if not text: return
 
         urls = self.url_pattern.findall(text)
-        if not urls:
-            return
+        if not urls: return
         
         target_url = urls[0]
-        logger.info(f"[LinkReader] 检测到链接，开始解析: {target_url}")
+        logger.info(f"[LinkReader] 检测到链接: {target_url}")
 
         content, screenshot_base64 = await self._fetch_url_content(target_url)
 
         if content:
-            injection = self.prompt_template.format(content=content)
-            # 注入文本
-            req.prompt += injection
-            
-            # 如果有截图，以 Base64 格式注入 prompt 实现多模态参考
+            req.prompt += self.prompt_template.format(content=content)
             if screenshot_base64:
-                req.prompt += f"\n(该链接页面的截图已自动抓取，请参考图片中的文字或视觉内容进行回答。)\n图片：data:image/jpeg;base64,{screenshot_base64}"
-            
-            logger.info(f"[LinkReader] 已将链接内容注入 Prompt (截图: {'有' if screenshot_base64 else '无'})")
+                req.prompt += f"\n(该页面截图已自动抓取)\n图片：data:image/jpeg;base64,{screenshot_base64}"
+            logger.info(f"[LinkReader] 已注入上下文 (截图: {'有' if screenshot_base64 else '无'})")
         else:
             logger.warning("[LinkReader] 未能提取到有效内容。")
 
     @filter.command("link_debug")
     async def link_debug(self, event: AstrMessageEvent, url: str):
-        """调试模式：返回解析结果"""
         if not url:
             yield event.plain_result("用法: /link_debug [URL]")
             return
-            
         yield event.plain_result(f"正在分析链接: {url} ...")
         content, screenshot = await self._fetch_url_content(url)
-        
-        msg = f"【抓取文本 (长度 {len(content)})】:\n\n{content}"
-        if screenshot:
-            msg += "\n\n(截图获取成功)"
-        
+        msg = f"【抓取结果】:\n\n{content}"
+        if screenshot: msg += "\n\n(截图获取成功)"
         yield event.plain_result(msg)
 
     @filter.command("link_status")
     async def link_status(self, event: AstrMessageEvent):
-        """查看插件各依赖状态"""
         status = ["【Link Reader 插件状态】"]
         status.append(f"插件总开关: {'✅ 开启' if self.enable_plugin else '❌ 关闭'}")
-        status.append(f"音乐搜索支持 (DDG): {'✅ 已安装' if HAS_DDG else '❌ 未安装'}")
-        status.append(f"截图功能支持 (Playwright): {'✅ 已启用' if HAS_PLAYWRIGHT else '❌ 未安装'}")
-        status.append(f"内容截断阈值: {self.max_length}")
-        
-        status.append("\n【Cookie 配置状态】")
-        platforms = ["xiaohongshu", "zhihu", "weibo", "bilibili", "douyin", "tieba", "lofter"]
-        for p in platforms:
-            has_cookie = "✅" if self.platform_cookies.get(p) else "❌"
-            status.append(f"- {p}: {has_cookie}")
-            
+        status.append(f"搜索支持 (DDG): {'✅ 已安装' if HAS_DDG else '❌ 未安装'}")
+        status.append(f"截图支持 (Playwright): {'✅ 已启用' if HAS_PLAYWRIGHT else '❌ 未安装'}")
         yield event.plain_result("\n".join(status))
