@@ -21,7 +21,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 from astrbot.api.provider import ProviderRequest
 
-@register("astrbot_plugin_link_reader", "AstrBot_Developer", "自动解析链接内容，支持多平台音乐 ID 直连及 xiaojiangclub.com 定向搜索。", "1.5.0")
+@register("astrbot_plugin_link_reader", "AstrBot_Developer", "自动解析链接内容，支持多平台音乐 ID 直连及 xiaojiangclub.com 定向搜索。", "1.5.1")
 class LinkReaderPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -136,7 +136,6 @@ class LinkReaderPlugin(Star):
                     id_match = re.search(r'id=(\d+)', final_url) or re.search(r'song/(\d+)', final_url)
                     if id_match:
                         song_id = id_match.group(1)
-                        # 使用用户指定的新版 API
                         api_url = f"https://music.163.com/api/song/lyric?id={song_id}&lv=-1&tv=-1"
                         headers = {"Referer": "https://music.163.com/", "Cookie": "os=pc", "User-Agent": self.user_agent}
                         async with session.get(api_url, headers=headers) as resp:
@@ -184,7 +183,6 @@ class LinkReaderPlugin(Star):
                         f_hash = hash_match.group(1)
                         api_url = f"http://krcs.kugou.com/search?ver=1&man=yes&client=mobi&hash={f_hash}"
                         async with session.get(api_url) as resp:
-                            # 酷狗接口较为严格，若无结果将跳转兜底搜索
                             pass
 
                 # 以上直连均失败，触发 xiaojiangclub 兜底搜索
@@ -216,8 +214,9 @@ class LinkReaderPlugin(Star):
             return "音乐链接解析失败。"
 
     async def _search_xiaojiang(self, song_name: str) -> Optional[str]:
-        """xiaojiangclub.com 搜索第一个链接获取歌词"""
+        """根据截图逻辑：定位 a.song-link 并拼接前缀获取歌词"""
         search_url = f"https://xiaojiangclub.com/?s={quote(song_name)}"
+        base_domain = "https://xiaojiangclub.com"
         headers = {"User-Agent": self.user_agent}
         try:
             async with aiohttp.ClientSession() as session:
@@ -225,21 +224,21 @@ class LinkReaderPlugin(Star):
                     if resp.status != 200: return None
                     soup = BeautifulSoup(await resp.text(), 'lxml')
                     
-                    # 查找第一个搜索结果链接 (通常在 h2.entry-title 或 article a 中)
-                    first_result = soup.find('h2', class_='entry-title') or soup.find('article')
-                    if not first_result:
+                    # 关键修改：根据截图，搜索 a 标签中 class 包含 song-link 的第一个项
+                    target_link_tag = soup.find('a', class_='song-link', href=True)
+                    if not target_link_tag:
+                        logger.warning(f"[LinkReader] xiaojiangclub 未找到 song-link 标签")
                         return None
                     
-                    target_link_tag = first_result.find('a', href=True)
-                    if not target_link_tag: return None
-                    target_link = target_link_tag['href']
+                    target_path = target_link_tag['href']
+                    # 拼接完整 URL
+                    target_link = target_path if target_path.startswith("http") else base_domain + target_path
                     
-                    # 访问详情页
-                    logger.info(f"[LinkReader] 正在访问搜索结果: {target_link}")
+                    logger.info(f"[LinkReader] 正在访问歌词页面: {target_link}")
                     async with session.get(target_link, headers=headers, timeout=10) as l_resp:
                         l_soup = BeautifulSoup(await l_resp.text(), 'lxml')
                         
-                        # 提取歌词容器 (entry-content 是 WordPress 常用的正文类名)
+                        # 提取歌词容器
                         content_container = l_soup.find('div', class_='entry-content') or l_soup.find('article')
                         if not content_container: content_container = l_soup
                         
@@ -250,7 +249,7 @@ class LinkReaderPlugin(Star):
                         raw_text = content_container.get_text(separator='\n', strip=True)
                         return self._filter_lyrics(raw_text)
         except Exception as e:
-            logger.error(f"[LinkReader] Xiaojiang 搜索失败: {e}")
+            logger.error(f"[LinkReader] Xiaojiang 搜索解析失败: {e}")
         return None
 
     async def _get_screenshot_and_content(self, url: str):
@@ -334,7 +333,7 @@ class LinkReaderPlugin(Star):
         status_msg = ["【Link Reader 插件状态报告】"]
         status_msg.append(f"插件运行: {'✅ 正常' if self.enable_plugin else '❌ 已禁用'}")
         status_msg.append(f"直连 API 支持: 网易云/QQ/酷我/酷狗")
-        status_msg.append(f"智能兜底源: xiaojiangclub.com")
+        status_msg.append(f"智能兜底源: xiaojiangclub.com (使用 song-link 匹配)")
         status_msg.append(f"Playwright 截图: {'✅ 已加载' if HAS_PLAYWRIGHT else '❌ 未就绪'}")
         status_msg.append(f"正文最大截断: {self.max_length} 字")
         yield event.plain_result("\n".join(status_msg))
