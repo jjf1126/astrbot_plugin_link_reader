@@ -7,6 +7,10 @@ from urllib.parse import urlparse
 import aiohttp
 from bs4 import BeautifulSoup
 
+from playwright.async_api import async_playwright
+from duckduckgo_search import DDGS
+import base64
+
 # 尝试导入 duckduckgo_search，如果未安装则降级处理
 try:
     from duckduckgo_search import AsyncDDGS
@@ -18,6 +22,26 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 from astrbot.api.provider import ProviderRequest
+
+async def get_screenshot_and_content(url):
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch() # 或者 p.firefox.launch(), p.webkit.launch()
+            page = await browser.new_page()
+            await page.goto(url, wait_until='networkidle') # 等待网络空闲，确保内容加载
+            
+            # 获取页面内容
+            content = await page.content()
+            
+            # 获取截图，可以直接获取base64编码的图片数据
+            screenshot_bytes = await page.screenshot(type='jpeg', quality=80) 
+            screenshot_base64 = base64.b64encode(screenshot_bytes).decode('utf-8')
+            
+            await browser.close()
+            return content, screenshot_base64
+    except Exception as e:
+        print(f"Error during screenshot or content fetching: {e}")
+        return None, None
 
 @register("astrbot_plugin_link_reader", "AstrBot_Developer", "一个强大的LLM上下文增强插件，自动解析链接内容。", "1.0.0", "https://github.com/your-repo/astrbot_plugin_link_reader")
 class LinkReaderPlugin(Star):
@@ -170,7 +194,7 @@ class LinkReaderPlugin(Star):
             logger.info(f"[LinkReader] 识别到音乐链接，提取关键词: {keyword}，开始搜索增强...")
 
             # 第二步：使用 DuckDuckGo 搜索
-            search_query = f"{keyword} 歌词 评价 含义"
+            search_query = f"{keyword} 歌词"
             results_text = []
             
             async with AsyncDDGS() as ddgs:
@@ -210,15 +234,21 @@ class LinkReaderPlugin(Star):
 
         # 抓取内容
         content = await self._fetch_url_content(target_url)
+        # 使用异步函数获取截图
+        html_content, screenshot_base64 = await get_screenshot_and_content(original_url)
 
         if content:
             # 注入 Prompt
             injection = self.prompt_template.format(content=content)
-            
+
+            if screenshot_base64:
+                req.prompt = f"{req.prompt}\n{injection_text}\n图片：data:image/jpeg;base64,{screenshot_base64}"
+            else:
+                
             # 这里选择追加到用户的 input_text 后面
             # 也可以选择修改 system_prompt，取决于具体效果
             # req.system_prompt += injection # 方式A
-            req.input_text += injection    # 方式B：更符合直觉，像用户贴了内容进去
+                req.prompt += injection    # 方式B：更符合直觉，像用户贴了内容进去
             
             logger.info(f"[LinkReader] 已将链接内容注入上下文 (长度: {len(content)})")
         else:
