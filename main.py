@@ -13,8 +13,12 @@ try:
     from duckduckgo_search import AsyncDDGS
     HAS_DDG = True
 except ImportError:
-    HAS_DDG = False
-
+    try:
+        # 兼容某些特定版本的导入方式
+        from duckduckgo_search.duckduckgo_search import AsyncDDGS
+        HAS_DDG = True
+    except ImportError:
+        HAS_DDG = False
 try:
     from playwright.async_api import async_playwright
     HAS_PLAYWRIGHT = True
