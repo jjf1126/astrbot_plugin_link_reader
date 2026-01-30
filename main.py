@@ -3,18 +3,12 @@ import asyncio
 import traceback
 import base64
 from typing import Optional, List, Dict
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 
 import aiohttp
 from bs4 import BeautifulSoup
 
-# 尝试导入可选依赖
-try:
-    from duckduckgo_search import DDGS
-    HAS_DDG = True
-except ImportError:
-    HAS_DDG = False
-
+# 尝试导入 Playwright 截图组件
 try:
     from playwright.async_api import async_playwright
     HAS_PLAYWRIGHT = True
@@ -76,7 +70,7 @@ class LinkReaderPlugin(Star):
         return headers
 
     def _is_music_site(self, url: str) -> bool:
-        """判断是否为音乐网站（包含短链接域名识别）"""
+        """判断是否为音乐网站（包含短链接域名）"""
         music_domains = [
             "music.163.com", "y.qq.com", "kugou.com", "kuwo.cn", 
             "spotify.com", "163cn.tv", "url.cn"
@@ -102,7 +96,6 @@ class LinkReaderPlugin(Star):
                     viewport={'width': 1280, 'height': 800}
                 )
                 page = await context.new_page()
-                # 针对社交平台增加超时时间
                 await page.goto(url, wait_until='networkidle', timeout=30000) 
                 
                 content = await page.content()
@@ -119,8 +112,8 @@ class LinkReaderPlugin(Star):
         """抓取并解析内容的主逻辑"""
         domain = urlparse(url).netloc
         
-        # 1. 音乐链接：直接走搜索增强，不截图
-        if self._is_music_site(url) and self.enable_music_search and HAS_DDG:
+        # 1. 音乐链接：走搜索增强
+        if self._is_music_site(url) and self.enable_music_search:
             music_text = await self._handle_music_smart_search(url)
             return music_text, None
         
@@ -148,7 +141,7 @@ class LinkReaderPlugin(Star):
                 
                 return self._clean_text(content), screenshot
 
-        # 3. 常规网页：aiohttp 抓取内容，不截图
+        # 3. 常规网页：aiohttp 抓取内容
         headers = self._get_headers(domain)
         try:
             async with aiohttp.ClientSession() as session:
@@ -169,7 +162,7 @@ class LinkReaderPlugin(Star):
             return f"解析链接时发生错误: {str(e)}", None
 
     async def _handle_music_smart_search(self, url: str) -> str:
-        """处理音乐链接：通过搜索获取具体歌词"""
+        """处理音乐链接：通过搜索引擎直接搜索歌词"""
         try:
             headers = {"User-Agent": self.user_agent}
             keyword = ""
@@ -184,36 +177,47 @@ class LinkReaderPlugin(Star):
             if not keyword:
                 keyword = url
 
-            # 优化关键词提取：剔除平台后缀及曲名外的多余信息
-            keyword = re.sub(r'( - .*| \| .*)$', '', keyword)
-            logger.info(f"[LinkReader] 识别到音乐链接，提取关键词: {keyword}，开始搜索增强...")
+            # 剔除平台后缀
+            keyword = re.sub(r'( - 网易云音乐| - QQ音乐| - 酷狗音乐| - 酷我音乐|\|.*)$', '', keyword).strip()
+            # 提取曲名
+            pure_song_name = re.sub(r' - .*$', '', keyword).strip()
+            
+            logger.info(f"[LinkReader] 识别音乐链接，开始直接网页搜索歌词: {pure_song_name}")
 
+            # 搜索词格式：曲名 歌词
             target_sites = ["lyrics.net.cn", "xiaojiangclub.com", "ufanv.cn", "geciyi.com"]
             site_query = " OR ".join([f"site:{site}" for site in target_sites])
-
-            # 第二步：使用 DuckDuckGo 搜索
-            search_query = f"{keyword}({site_query})"
-            results_text = []
+            search_query = f"{pure_song_name} ({site_query})"
             
-            # 适配最新版 duckduckgo_search API
-            if HAS_DDG:
-                with DDGS() as ddgs:
-                    results = ddgs.text(search_query, max_results=3)
-                    for r in results:
-                        results_text.append(f"来源: {r['title']}\n摘要: {r['body']}")
+            results_text = []
+            search_url = f"https://www.bing.com/search?q={quote(search_query)}"
+            
+            # 直接通过 HTTP 请求获取搜索引擎结果
+            async with aiohttp.ClientSession() as session:
+                async with session.get(search_url, headers=headers, timeout=10) as response:
+                    if response.status == 200:
+                        search_html = await response.text()
+                        search_soup = BeautifulSoup(search_html, 'lxml')
+                        # 简单解析搜索结果块
+                        items = search_soup.find_all('li', class_='b_algo')
+                        for item in items[:3]:
+                            title_tag = item.find('h2')
+                            snippet_tag = item.find('p') or item.find('div', class_='b_caption')
+                            if title_tag and snippet_tag:
+                                results_text.append(f"来源: {title_tag.get_text()}\n摘要: {snippet_tag.get_text()}")
             
             if results_text:
-                return f"【音乐链接智能解析】\n识别歌曲: {keyword}\n\n网络搜索歌词结果:\n" + "\n---\n".join(results_text)
+                return f"【音乐链接智能解析】\n识别歌曲: {keyword}\n\n网页搜索歌词结果:\n" + "\n---\n".join(results_text)
             else:
-                return f"识别到音乐链接: {keyword}，但未在指定的搜索网站中找到具体歌词。"
+                return f"识别到音乐链接: {keyword}，但未能通过网页搜索获取到详细歌词信息。"
 
         except Exception as e:
-            logger.warning(f"[LinkReader] 音乐智能解析失败: {e}")
+            logger.warning(f"[LinkReader] 网页搜索歌词失败: {e}")
             return f"音乐链接解析失败: {str(e)}"
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
-        """核心钩子：拦截请求并注入链接内容及图片"""
+        """核心钩子：注入内容及图片"""
         if not self.enable_plugin:
             return
 
@@ -235,17 +239,17 @@ class LinkReaderPlugin(Star):
             # 注入文本到 prompt 属性
             req.prompt += injection
             
-            # 如果有截图，以 Base64 格式注入 prompt 实现多模态参考
+            # 如果有截图，以 Base64 格式注入
             if screenshot_base64:
-                req.prompt += f"\n(该链接页面的截图已自动抓取，请参考图片中的文字或视觉内容进行回答。)\n图片：data:image/jpeg;base64,{screenshot_base64}"
+                req.prompt += f"\n(该页面截图已自动抓取，请参考图片内容回答。)\n图片：data:image/jpeg;base64,{screenshot_base64}"
             
-            logger.info(f"[LinkReader] 已将链接内容注入 Prompt (截图: {'有' if screenshot_base64 else '无'})")
+            logger.info(f"[LinkReader] 已完成内容注入 (截图: {'有' if screenshot_base64 else '无'})")
         else:
             logger.warning("[LinkReader] 未能提取到有效内容。")
 
     @filter.command("link_debug")
     async def link_debug(self, event: AstrMessageEvent, url: str):
-        """调试模式：返回解析结果"""
+        """调试模式"""
         if not url:
             yield event.plain_result("用法: /link_debug [URL]")
             return
@@ -264,7 +268,6 @@ class LinkReaderPlugin(Star):
         """查看插件各依赖状态"""
         status = ["【Link Reader 插件状态】"]
         status.append(f"插件总开关: {'✅ 开启' if self.enable_plugin else '❌ 关闭'}")
-        status.append(f"音乐搜索支持 (DDG): {'✅ 已安装' if HAS_DDG else '❌ 未安装'}")
         status.append(f"截图功能支持 (Playwright): {'✅ 已启用' if HAS_PLAYWRIGHT else '❌ 未安装'}")
         status.append(f"内容截断阈值: {self.max_length}")
         
