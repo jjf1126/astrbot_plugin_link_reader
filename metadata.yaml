@@ -1,0 +1,5 @@
+name: astrbot_plugin_link_context_reader
+author: YourName
+description: 智能链接内容读取与LLM上下文增强插件。当检测到消息包含URL时，自动拦截并解析内容：支持通用网页正文提取；支持小红书、知乎、微博、LOFTER等社交平台的深度内容抓取；识别音乐链接并自动搜索对应歌词。解析后的内容将自动注入LLM提示词中，实现基于链接内容的智能回复。
+version: 1.0.0
+repo: https://github.com/YourName/astrbot_plugin_link_context_reader
