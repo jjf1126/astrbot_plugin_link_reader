@@ -178,6 +178,7 @@ class LinkReaderPlugin(Star):
             # 第一步：简单尝试获取网页 Title 作为关键词
             headers = {"User-Agent": self.user_agent}
             keyword = ""
+
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, headers=headers, timeout=5, ssl=False) as resp:
                     if resp.status == 200:
@@ -190,7 +191,7 @@ class LinkReaderPlugin(Star):
                 keyword = url # 降级使用 URL
 
             # 清理 Title 中的杂项 (如 " - 网易云音乐")
-            keyword = re.sub(r'( - .*| \| .*)$', '', keyword)
+            keyword = re.sub(r'( - 网易云音乐| - QQ音乐| - 酷狗音乐| \| .*)$', '', keyword).strip()
             logger.info(f"[LinkReader] 识别到音乐链接，提取关键词: {keyword}，开始搜索增强...")
 
             # 第二步：使用 DuckDuckGo 搜索
